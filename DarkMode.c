@@ -21,6 +21,9 @@
 /* Define */
 #define DARK_BUF_SIZE					256
 
+//KJK_DEBUG 다크 모드 강제 설정 0 : OS 설정에 따라 1 : 항상 라이트 2 : 항상 어두운
+#define DARK_MODE_FORCE_MODE			1
+
 // ダークモードに対応する最小のビルド番号 (Windows 10 1809)
 #define DARK_MODE_MIN_BUILD				17763
 // DWMWA_USE_IMMERSIVE_DARK_MODE が現在の値になった最小のビルド番号
@@ -313,7 +316,13 @@ void dark_mode_init(void)
 	}
 
 	dark_mode_support = TRUE;
+#if DARK_MODE_FORCE_MODE == 1
+	dark_mode_dark = FALSE;
+#elif DARK_MODE_FORCE_MODE == 2
+	dark_mode_dark = TRUE;
+#else
 	dark_mode_dark = dark_mode_get_os_setting();
+#endif
 	dark_mode_set_app_mode();
 }
 
@@ -361,7 +370,13 @@ BOOL dark_mode_update(void)
 	if (dark_mode_support == FALSE) {
 		return FALSE;
 	}
+#if DARK_MODE_FORCE_MODE == 1
+	dark = FALSE;
+#elif DARK_MODE_FORCE_MODE == 2
+	dark = TRUE;
+#else
 	dark = dark_mode_get_os_setting();
+#endif
 	if (dark == dark_mode_dark) {
 		return FALSE;
 	}

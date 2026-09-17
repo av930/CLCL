@@ -26,6 +26,7 @@
 #include "Font.h"
 #include "dpi.h"
 #include "DarkMode.h"
+#include "Search.h"
 
 #include "resource.h"
 
@@ -77,6 +78,16 @@ static HICON menu_icon_default;
 static HICON menu_icon_folder;
 static int menu_icon_load_size;
 
+// 履歴メニューの検索ボックス
+#define MENU_SEARCH_MATCH_COLOR		RGB(255, 0, 0)
+static TCHAR search_query[BUF_SIZE];
+static int search_query_len;
+static BOOL search_history_present;
+static HMENU search_hmenu;
+static MENU_ITEM_INFO search_box_mii;
+static MENU_ITEM_INFO search_sep_mii;
+static HHOOK search_key_hook;
+
 extern HINSTANCE hInst;
 
 // オプション
@@ -90,6 +101,15 @@ static MENU_ITEM_INFO *menu_id_to_menuitem(MENU_ITEM_INFO *mii, const int mcnt, 
 static HICON menu_read_icon(const TCHAR *file_name, const int index, const int icon_size);
 static HFONT menu_create_font(void);
 static int menu_get_item_size(const MENU_ITEM_INFO *mii, int *width);
+static BOOL menu_search_is_printable_vk(const DWORD vk);
+static int menu_search_get_hilite(const HMENU hMenu);
+static void menu_search_redraw(void);
+static void menu_search_update_box_text(void);
+static void menu_search_add_char(const TCHAR ch);
+static void menu_search_backspace(void);
+static void menu_search_execute(void);
+static void menu_search_clear(void);
+static LRESULT CALLBACK menu_search_hook_proc(int nCode, WPARAM wParam, LPARAM lParam);
 static void menu_create_text(const int index, const TCHAR *buf, TCHAR *ret);
 static BOOL menu_create_datainfo(DATA_INFO *set_di,
 								MENU_ITEM_INFO *mii, int menu_index, int *id,
@@ -125,6 +145,8 @@ static void menu_item_free(MENU_ITEM_INFO *mii, int cnt)
 		}
 		mem_free(&((mii + i)->text));
 		mem_free(&((mii + i)->hkey));
+		mem_free((void **)&((mii + i)->match_pos));
+		mem_free((void **)&((mii + i)->match_len));
 		if ((mii + i)->free_icon == TRUE && (mii + i)->icon != NULL) {
 			DestroyIcon((mii + i)->icon);
 		}
@@ -325,9 +347,25 @@ int menu_show(const HWND hWnd, const HMENU hMenu, const POINT *mpos)
 	DWORD ret;
 
 	menu_get_show_point(mpos, &apos);
+	if (search_history_present == TRUE && hMenu == search_hmenu) {
+		MENUITEMINFO mii;
+
+		ZeroMemory(&mii, sizeof(mii));
+		mii.cbSize = sizeof(mii);
+		mii.fMask = MIIM_STATE;
+		mii.fState = MFS_HILITE;
+		SetMenuItemInfo(hMenu, 0, TRUE, &mii);
+		SetMenuDefaultItem(hMenu, 0, TRUE);
+		// 検索ボックスへの入力を横取りするフックを設定
+		search_key_hook = SetWindowsHookEx(WH_KEYBOARD_LL, menu_search_hook_proc, hInst, 0);
+	}
 	ret = TrackPopupMenu(hMenu,
 		TPM_TOPALIGN | TPM_LEFTBUTTON | TPM_RIGHTBUTTON | TPM_RETURNCMD,
 		apos.x, apos.y, 0, hWnd, NULL);
+	if (search_key_hook != NULL) {
+		UnhookWindowsHookEx(search_key_hook);
+		search_key_hook = NULL;
+	}
 	PostMessage(hWnd, WM_NULL, 0, 0);
 	return ret;
 }
@@ -438,6 +476,14 @@ static int menu_get_item_size(const MENU_ITEM_INFO *mii, int *width)
 
 	text_x = mii->text_x;
 	text_y = mii->text_y;
+
+	if (mii->search_hidden == TRUE) {
+		// 検索で非一致のため非表示
+		if (width != NULL) {
+			*width = 0;
+		}
+		return 0;
+	}
 
 	if (mii->flag & MF_SEPARATOR) {
 		// 区切り
@@ -1099,7 +1145,9 @@ HMENU menu_create(const HWND hWnd, MENU_INFO *menu_info, const int menu_cnt,
 	HMENU hMenu;
 	HDC hdc;
 	HFONT hFont, hRetFont;
+	SIZE size;
 	int id = 0;
+	int i;
 
 	// 表示するモニタのDPIに合わせる
 	if (IsRectEmpty(&menu_monitor_rect) != FALSE) {
@@ -1124,6 +1172,38 @@ HMENU menu_create(const HWND hWnd, MENU_INFO *menu_info, const int menu_cnt,
 	// フォント設定
 	hFont = menu_create_font();
 	hRetFont = SelectObject(hdc, hFont);
+
+	// 履歴を含むメニューの場合、先頭に検索ボックスを追加する
+	search_hmenu = NULL;
+	search_history_present = FALSE;
+	search_query[0] = TEXT('\0');
+	search_query_len = 0;
+	for (i = 0; i < menu_cnt; i++) {
+		if ((menu_info + i)->content == MENU_CONTENT_HISTORY ||
+			(menu_info + i)->content == MENU_CONTENT_HISTORY_DESC) {
+			search_history_present = TRUE;
+			break;
+		}
+	}
+	if (search_history_present == TRUE) {
+		ZeroMemory(&search_box_mii, sizeof(search_box_mii));
+		search_box_mii.id = ID_MENU_SEARCH_BOX;
+		search_box_mii.flag = MF_OWNERDRAW | MF_DISABLED;
+		search_box_mii.item = (LPCTSTR)&search_box_mii;
+		search_box_mii.text = alloc_copy(TEXT("Search: "));
+		GetTextExtentPoint32(hdc, search_box_mii.text, lstrlen(search_box_mii.text), &size);
+		search_box_mii.text_x = size.cx;
+		search_box_mii.text_y = size.cy;
+		AppendMenu(hMenu, search_box_mii.flag, search_box_mii.id, (LPCTSTR)&search_box_mii);
+
+		ZeroMemory(&search_sep_mii, sizeof(search_sep_mii));
+		search_sep_mii.flag = MF_SEPARATOR | MF_OWNERDRAW;
+		search_sep_mii.item = (LPCTSTR)&search_sep_mii;
+		AppendMenu(hMenu, search_sep_mii.flag, 0, (LPCTSTR)&search_sep_mii);
+
+		search_hmenu = hMenu;
+	}
+
 	// メニューに項目を設定
 	menu_set_item(hdc, hMenu, menu_item_info, menu_item_cnt);
 	SelectObject(hdc, hRetFont);
@@ -1150,6 +1230,17 @@ void menu_destory(HMENU hMenu)
 {
 	HMENU hSubMenu;
 	int cnt, i;
+
+	if (hMenu == search_hmenu) {
+		// 検索ボックスの状態を破棄
+		mem_free(&search_box_mii.text);
+		ZeroMemory(&search_box_mii, sizeof(search_box_mii));
+		ZeroMemory(&search_sep_mii, sizeof(search_sep_mii));
+		search_hmenu = NULL;
+		search_history_present = FALSE;
+		search_query[0] = TEXT('\0');
+		search_query_len = 0;
+	}
 
 	cnt = GetMenuItemCount(hMenu);
 	for (i = 0; i < cnt; i++) {
@@ -1308,6 +1399,279 @@ static void menu_draw_arrow(const HDC draw_dc, const RECT *rect, const COLORREF 
 }
 
 /*
+ * menu_search_is_printable_vk - 検索文字として扱う仮想キーか判定
+ */
+static BOOL menu_search_is_printable_vk(const DWORD vk)
+{
+	if ((vk >= '0' && vk <= '9') || (vk >= 'A' && vk <= 'Z')) {
+		return TRUE;
+	}
+	if (vk == VK_SPACE) {
+		return TRUE;
+	}
+	if (vk >= VK_NUMPAD0 && vk <= VK_DIVIDE) {
+		return TRUE;
+	}
+	if (vk >= 0xBA && vk <= 0xC0) {
+		// OEM_1 (;:) 〜 OEM_3 (`~)
+		return TRUE;
+	}
+	if (vk >= 0xDB && vk <= 0xE2) {
+		// OEM_4 ([{) 〜 OEM_102
+		return TRUE;
+	}
+	return FALSE;
+}
+
+/*
+ * menu_search_get_hilite - 現在ハイライトされている項目位置を取得
+ */
+static int menu_search_get_hilite(const HMENU hMenu)
+{
+	int cnt, i;
+
+	cnt = GetMenuItemCount(hMenu);
+	for (i = 0; i < cnt; i++) {
+		if (GetMenuState(hMenu, i, MF_BYPOSITION) & MF_HILITE) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+/*
+ * menu_search_redraw - 検索ボックスとメニュー全体の再描画を要求
+ */
+static void menu_search_redraw(void)
+{
+	HWND menu_wnd;
+
+	if ((menu_wnd = FindWindow(TEXT("#32768"), NULL)) == NULL) {
+		return;
+	}
+	InvalidateRect(menu_wnd, NULL, TRUE);
+	UpdateWindow(menu_wnd);
+}
+
+/*
+ * menu_search_update_box_text - 検索ボックスの表示テキストを更新
+ */
+static void menu_search_update_box_text(void)
+{
+	TCHAR buf[BUF_SIZE + 32];
+	MENUITEMINFO mii;
+
+	if (search_hmenu == NULL) {
+		return;
+	}
+	mem_free(&search_box_mii.text);
+	if (search_query_len == 0) {
+		lstrcpy(buf, TEXT("Search:"));
+	} else {
+		wsprintf(buf, TEXT("Search: %s_"), search_query);
+	}
+	search_box_mii.text = alloc_copy(buf);
+
+	// 再描画をシステムに促す (サイズは変更しない)
+	ZeroMemory(&mii, sizeof(mii));
+	mii.cbSize = sizeof(mii);
+	mii.fMask = MIIM_FTYPE | MIIM_DATA;
+	mii.fType = MFT_OWNERDRAW;
+	mii.dwItemData = (ULONG_PTR)&search_box_mii;
+	SetMenuItemInfo(search_hmenu, ID_MENU_SEARCH_BOX, FALSE, &mii);
+
+	menu_search_redraw();
+}
+
+/*
+ * menu_search_add_char - 検索クエリに文字を追加
+ */
+static void menu_search_add_char(const TCHAR ch)
+{
+	if (search_query_len >= BUF_SIZE - 1) {
+		return;
+	}
+	search_query[search_query_len++] = ch;
+	search_query[search_query_len] = TEXT('\0');
+	menu_search_update_box_text();
+	menu_search_execute();
+}
+
+/*
+ * menu_search_backspace - 検索クエリの末尾を1文字削除
+ */
+static void menu_search_backspace(void)
+{
+	if (search_query_len == 0) {
+		return;
+	}
+	search_query[--search_query_len] = TEXT('\0');
+	menu_search_update_box_text();
+	menu_search_execute();
+}
+
+/*
+ * menu_search_execute - 検索を実行し、一致/非一致を項目に反映する
+ */
+static void menu_search_execute(void)
+{
+	MENUITEMINFO mii;
+	MENU_ITEM_INFO *item;
+	SEARCH_MATCH *matches;
+	int match_cnt;
+	int cnt, i, j;
+
+	if (search_hmenu == NULL) {
+		return;
+	}
+	cnt = GetMenuItemCount(search_hmenu);
+	for (i = 0; i < cnt; i++) {
+		UINT break_flag;
+
+		ZeroMemory(&mii, sizeof(mii));
+		mii.cbSize = sizeof(mii);
+		mii.fMask = MIIM_DATA | MIIM_FTYPE;
+		if (GetMenuItemInfo(search_hmenu, i, TRUE, &mii) == 0 || mii.dwItemData == 0) {
+			continue;
+		}
+		item = (MENU_ITEM_INFO *)mii.dwItemData;
+		if (item == &search_box_mii || item == &search_sep_mii || (item->flag & MF_SEPARATOR)) {
+			continue;
+		}
+		// 列区切り (MFT_MENUBREAK/MFT_MENUBARBREAK) は item->flag に保持されていないため、
+		// 現在の状態から読み取って後で再設定時に維持する
+		break_flag = mii.fType & (MFT_MENUBREAK | MFT_MENUBARBREAK);
+
+		// 既存のハイライト情報を破棄
+		mem_free((void **)&item->match_pos);
+		mem_free((void **)&item->match_len);
+		item->match_cnt = 0;
+
+		if (item->show_bitmap == TRUE) {
+			// 画像は検索対象外だが、レイアウトは維持しておく
+			item->search_hidden = FALSE;
+		} else if (search_query_len == 0 || item->text == NULL) {
+			item->search_hidden = FALSE;
+		} else if (search_text_match(item->text, search_query, &matches, &match_cnt) == TRUE) {
+			item->match_pos = mem_alloc(sizeof(int) * match_cnt);
+			item->match_len = mem_alloc(sizeof(int) * match_cnt);
+			if (item->match_pos != NULL && item->match_len != NULL) {
+				for (j = 0; j < match_cnt; j++) {
+					item->match_pos[j] = matches[j].pos;
+					item->match_len[j] = matches[j].len;
+				}
+				item->match_cnt = match_cnt;
+			}
+			item->search_hidden = FALSE;
+			search_free_matches(matches);
+		} else {
+			item->search_hidden = FALSE;
+			item->match_cnt = 0;
+		}
+
+		// 表示/非表示によるサイズの変更を再計算させる (列区切りは維持する)
+		ZeroMemory(&mii, sizeof(mii));
+		mii.cbSize = sizeof(mii);
+		mii.fMask = MIIM_FTYPE | MIIM_DATA;
+		mii.fType = (UINT)(item->flag & MFT_OWNERDRAW) | break_flag;
+		mii.dwItemData = (ULONG_PTR)item;
+		SetMenuItemInfo(search_hmenu, i, TRUE, &mii);
+	}
+	menu_search_redraw();
+}
+
+/*
+ * menu_search_clear - 検索クエリをクリアして全項目を再表示
+ */
+static void menu_search_clear(void)
+{
+	search_query[0] = TEXT('\0');
+	search_query_len = 0;
+	menu_search_update_box_text();
+	menu_search_execute();
+}
+
+/*
+ * menu_search_hook_proc - 検索ボックスへのキー入力を横取りするフック
+ */
+static LRESULT CALLBACK menu_search_hook_proc(int nCode, WPARAM wParam, LPARAM lParam)
+{
+	KBDLLHOOKSTRUCT *kb = (KBDLLHOOKSTRUCT *)lParam;
+	BYTE state[256];
+	WCHAR buf[4];
+	int n;
+
+	if (nCode == HC_ACTION && search_hmenu != NULL &&
+		(wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+		switch (kb->vkCode) {
+		case VK_BACK:
+			menu_search_backspace();
+			return 1;
+
+		case VK_ESCAPE:
+			if (search_query_len > 0) {
+				// クエリが残っている場合はクリアのみ行い、メニューは閉じない
+				menu_search_clear();
+				return 1;
+			}
+			break;
+
+		default:
+			if (menu_search_is_printable_vk(kb->vkCode) == FALSE) {
+				break;
+			}
+			if (GetKeyboardState(state) == FALSE) {
+				break;
+			}
+			n = ToUnicode(kb->vkCode, kb->scanCode, state, buf, 4, 0);
+			if (n == 1 && buf[0] >= TEXT(' ')) {
+				menu_search_add_char((TCHAR)buf[0]);
+				return 1;
+			}
+			break;
+		}
+	}
+	return CallNextHookEx(search_key_hook, nCode, wParam, lParam);
+}
+
+/*
+ * menu_draw_text_highlight - 検索で一致した部分を赤色で描画
+ */
+static void menu_draw_text_highlight(const HDC draw_dc, const RECT *rect, const MENU_ITEM_INFO *mii,
+									const COLORREF normal_color)
+{
+	TCHAR *text = mii->text;
+	int len = lstrlen(text);
+	int x = rect->left;
+	int y_center = rect->top + (rect->bottom - rect->top) / 2;
+	SIZE sz;
+	int pos = 0;
+	int i;
+
+	for (i = 0; i < mii->match_cnt && pos < len; i++) {
+		int mpos = mii->match_pos[i];
+		int mlen = mii->match_len[i];
+
+		if (mpos > pos) {
+			GetTextExtentPoint32(draw_dc, text + pos, mpos - pos, &sz);
+			SetTextColor(draw_dc, normal_color);
+			TextOut(draw_dc, x, y_center - sz.cy / 2, text + pos, mpos - pos);
+			x += sz.cx;
+		}
+		GetTextExtentPoint32(draw_dc, text + mpos, mlen, &sz);
+		SetTextColor(draw_dc, MENU_SEARCH_MATCH_COLOR);
+		TextOut(draw_dc, x, y_center - sz.cy / 2, text + mpos, mlen);
+		x += sz.cx;
+		pos = mpos + mlen;
+	}
+	if (pos < len) {
+		GetTextExtentPoint32(draw_dc, text + pos, len - pos, &sz);
+		SetTextColor(draw_dc, normal_color);
+		TextOut(draw_dc, x, y_center - sz.cy / 2, text + pos, len - pos);
+	}
+}
+
+/*
  * menu_drawitem - メニュー項目を描画
  */
 BOOL menu_drawitem(const DRAWITEMSTRUCT *ds)
@@ -1445,9 +1809,14 @@ BOOL menu_drawitem(const DRAWITEMSTRUCT *ds)
 		left_margin += MENU_TEXT_MARGIN_LEFT;
 		SetRect(&draw_rect, left_margin, 0, width - MENU_TEXT_MARGIN_RIGHT, height);
 		if (mii->hkey == NULL) {
-			DrawText(draw_dc,
-				mii->text, lstrlen(mii->text),
-				&draw_rect, DT_VCENTER | DT_SINGLELINE | DT_NOCLIP | DT_WORD_ELLIPSIS);
+			if (mii->match_cnt > 0) {
+				// 検索で一致した部分を赤色で描画
+				menu_draw_text_highlight(draw_dc, &draw_rect, mii, text_color);
+			} else {
+				DrawText(draw_dc,
+					mii->text, lstrlen(mii->text),
+					&draw_rect, DT_VCENTER | DT_SINGLELINE | DT_NOCLIP | DT_WORD_ELLIPSIS);
+			}
 		} else {
 			GetTextExtentPoint32(draw_dc, mii->hkey, lstrlen(mii->hkey), &sz);
 			draw_rect.right -= (sz.cx + 10);

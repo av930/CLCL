@@ -17,6 +17,8 @@
 
 /* Define */
 #define ID_MENUITEM_DATA				50000
+// 履歴メニューの検索ボックス用の予約ID (ID_MENUITEM_DATAの範囲と重複しない)
+#define ID_MENU_SEARCH_BOX				(ID_MENUITEM_DATA - 1)
 
 #define MENU_CONTENT_SEPARATOR			0
 #define MENU_CONTENT_HISTORY			1
@@ -50,6 +52,11 @@ typedef struct _MENU_ITEM_INFO {
 
 	BOOL show_format;					// 形式表示
 	BOOL show_bitmap;					// ビットマップ表示
+
+	int *match_pos;						// 検索でヒットした位置 (赤字表示用)
+	int *match_len;
+	int match_cnt;
+	BOOL search_hidden;					// 検索で非一致のため非表示
 
 	DATA_INFO *set_di;					// データ情報
 	DATA_INFO *show_di;					// 表示するデータ情報
